@@ -280,7 +280,7 @@ def forecast(
     future_dates = [(df['date'].iloc[-1] + timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(steps)]
     hist = df.tail(120)
 
-    result {
+    result = {
         "currency": cur_display,
         "current_rate": round(current_rate, 4),
         "buying": round(float(df['buying'].iloc[-1]), 2),
