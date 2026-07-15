@@ -1,3 +1,8 @@
+import time
+_forecast_cache = {}
+CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
 # ══════════════════════════════════════════════════════════════════
 # main.py — FastAPI backend for Mshauri wa Malipo ya Kigeni
 # ══════════════════════════════════════════════════════════════════
@@ -246,6 +251,10 @@ def forecast(
     amount: float = Query(1000.0, gt=0),
 ):
     cur_key = currency.lower()
+    cache_key = (cur_key, steps, purpose, amount)
+    cached = _forecast_cache.get(cache_key)
+    if cached and (time.time() - cached['ts']) < CACHE_TTL_SECONDS:
+        return cached['data']
     cur_display = CURRENCIES[cur_key]
 
     if cur_display not in _data_cache:
@@ -271,7 +280,7 @@ def forecast(
     future_dates = [(df['date'].iloc[-1] + timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(steps)]
     hist = df.tail(120)
 
-    return {
+    result {
         "currency": cur_display,
         "current_rate": round(current_rate, 4),
         "buying": round(float(df['buying'].iloc[-1]), 2),
@@ -301,6 +310,8 @@ def forecast(
             },
         },
     }
+    _forecast_cache[cache_key] = {'data': result, 'ts': time.time()}
+    return result
 
 @app.get("/api/compare")
 def compare():
