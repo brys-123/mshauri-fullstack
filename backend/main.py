@@ -151,8 +151,8 @@ def get_ensemble(models_dict, df, cur_key, steps):
         if p is not None: forecasts['LSTM'] = p
     p = pred_arima(models_dict[cur_key]['arima'], steps)
     if p is not None: forecasts['ARIMA'] = p
-    p = pred_prophet(models_dict[cur_key]['prophet'], steps)
-    if p is not None: forecasts['Prophet'] = p
+    # p = pred_prophet(models_dict[cur_key]['prophet'], steps)
+    # if p is not None: forecasts['Prophet'] = p
     if not forecasts:
         return None, {}
     ensemble = np.mean(list(forecasts.values()), axis=0)
