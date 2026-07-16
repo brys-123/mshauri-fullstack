@@ -1,5 +1,8 @@
 # ══════════════════════════════════════════════════════════════════
 # main.py — FastAPI backend for Mshauri wa Malipo ya Kigeni
+# Live "today" price now comes from your currency-scraper GitHub repo
+# (real BOT data, updated daily), matching your research report's
+# documented data source instead of an external non-BOT API.
 # ══════════════════════════════════════════════════════════════════
 
 import os
@@ -8,6 +11,7 @@ import joblib
 import requests
 import numpy as np
 import pandas as pd
+from io import StringIO
 from datetime import timedelta, date as date_cls
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,6 +65,8 @@ CACHE_TTL_SECONDS = 300  # 5 minutes
 _live_rate_cache = {}
 LIVE_RATE_TTL = 3600  # 1 hour
 
+BOT_SCRAPER_CSV_URL = "https://raw.githubusercontent.com/brys-123/currency-scraper/main/BOT_exchange_rate.csv"
+
 
 def load_data():
     for cur, name in CURRENCIES.items():
@@ -102,31 +108,34 @@ def startup():
     load_models()
 
 
-def fetch_live_rate(cur_code):
-    """cur_code: 'USD', 'EUR', 'CNY'. Returns (rate_to_tzs, source_note) or None on failure."""
+def fetch_live_bot_rate(cur_code):
+    """
+    Pulls the latest scraped BOT rate for cur_code ('USD','EUR','CNY') from
+    the currency-scraper GitHub repo (scraped daily from bot.go.tz).
+    Returns (buying, selling, mean, transaction_date_str) or None on failure.
+    """
     cached = _live_rate_cache.get(cur_code)
     if cached and (time.time() - cached['ts']) < LIVE_RATE_TTL:
-        return cached['rate'], cached['note']
+        return cached['data']
     try:
-        resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8)
+        resp = requests.get(BOT_SCRAPER_CSV_URL, timeout=10)
         resp.raise_for_status()
-        payload = resp.json()
-        rates = payload.get('rates', {})
-        usd_to_tzs = rates.get('TZS')
-        if usd_to_tzs is None:
+        df = pd.read_csv(StringIO(resp.text))
+        df['Transaction Date'] = pd.to_datetime(df['Transaction Date'])
+        rows = df[df['Currency'] == cur_code].sort_values('Transaction Date')
+        if rows.empty:
             return None
-        if cur_code == 'USD':
-            rate = usd_to_tzs
-        else:
-            usd_to_cur = rates.get(cur_code)
-            if not usd_to_cur:
-                return None
-            rate = usd_to_tzs / usd_to_cur
-        note = payload.get('time_last_update_utc', 'live')
-        _live_rate_cache[cur_code] = {'rate': rate, 'note': note, 'ts': time.time()}
-        return rate, note
+        latest = rows.iloc[-1]
+        result = (
+            float(latest['Buying']),
+            float(latest['Selling']),
+            float(latest['Mean']),
+            latest['Transaction Date'].strftime('%Y-%m-%d'),
+        )
+        _live_rate_cache[cur_code] = {'data': result, 'ts': time.time()}
+        return result
     except Exception as e:
-        print(f"[LIVE RATE FETCH FAILED] {cur_code}: {e}")
+        print(f"[BOT SCRAPER FETCH FAILED] {cur_code}: {e}")
         return None
 
 
@@ -180,10 +189,6 @@ def pred_lstm(model, scaler, df, steps, seq=60):
         return None
 
 def get_ensemble(models_dict, df, cur_key, steps):
-    # NOTE: Prophet intentionally excluded here — backtesting showed it has
-    # the highest error of all 4 models across every currency (4-15% MAPE
-    # vs <3% for the others). Still loaded and shown in the debug panel for
-    # transparency, just not averaged into the live advice.
     forecasts = {}
     p = pred_xgboost(models_dict[cur_key]['xgboost'], df, steps)
     if p is not None: forecasts['XGBoost'] = p
@@ -299,18 +304,17 @@ def forecast(
     using_live_rate = False
     live_note = None
 
-    live = fetch_live_rate(cur_display)
-    today_ts = pd.Timestamp(date_cls.today())
-    if live and df['date'].iloc[-1].date() < today_ts.date():
-        live_rate, live_note = live
-        recent_spread_pct = ((df['selling'] - df['buying']) / df['mean']).tail(30).mean()
-        est_buy = live_rate * (1 - recent_spread_pct / 2)
-        est_sell = live_rate * (1 + recent_spread_pct / 2)
-        new_row = pd.DataFrame([{
-            'date': today_ts, 'buying': est_buy, 'selling': est_sell, 'mean': live_rate
-        }])
-        df = pd.concat([df, new_row], ignore_index=True).sort_values('date').reset_index(drop=True)
-        using_live_rate = True
+    live = fetch_live_bot_rate(cur_display)
+    if live:
+        buy, sell, mean_rate, txn_date_str = live
+        txn_date = pd.Timestamp(txn_date_str)
+        if txn_date.date() > df['date'].iloc[-1].date():
+            new_row = pd.DataFrame([{
+                'date': txn_date, 'buying': buy, 'selling': sell, 'mean': mean_rate
+            }])
+            df = pd.concat([df, new_row], ignore_index=True).sort_values('date').reset_index(drop=True)
+            using_live_rate = True
+            live_note = f"BOT ({txn_date_str})"
 
     current_rate = float(df['mean'].iloc[-1])
     prev_rate = float(df['mean'].iloc[-2])
@@ -331,8 +335,6 @@ def forecast(
     future_dates = [(df['date'].iloc[-1] + timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(steps)]
     hist = df.tail(120)
 
-    # For debug transparency, also compute Prophet's prediction even though
-    # it's excluded from the live advice ensemble above.
     debug_forecasts = dict(all_forecasts)
     p_prophet = pred_prophet(_models_cache[cur_key]['prophet'], steps)
     if p_prophet is not None:
