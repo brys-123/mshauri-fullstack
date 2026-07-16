@@ -7,6 +7,7 @@ CACHE_TTL_SECONDS = 300  # 5 minutes
 # main.py — FastAPI backend for Mshauri wa Malipo ya Kigeni
 # ══════════════════════════════════════════════════════════════════
 
+from datetime import date as date_cls
 import os
 import joblib
 import numpy as np
@@ -277,7 +278,8 @@ def forecast(
     bda = best_day_analysis(df)
     conf_label, conf_note = get_confidence_label(all_forecasts)
 
-    future_dates = [(df['date'].iloc[-1] + timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(steps)]
+    today = pd.Timestamp(date_cls.today())
+    future_dates = [(today + timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(steps)]
     hist = df.tail(120)
 
     result = {
