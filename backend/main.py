@@ -3,10 +3,12 @@
 # ══════════════════════════════════════════════════════════════════
 
 import os
+import time
 import joblib
+import requests
 import numpy as np
 import pandas as pd
-from datetime import timedelta
+from datetime import timedelta, date as date_cls
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -53,6 +55,13 @@ _data_cache = {}
 _models_cache = {}
 _load_errors = {}
 
+_forecast_cache = {}
+CACHE_TTL_SECONDS = 300  # 5 minutes
+
+_live_rate_cache = {}
+LIVE_RATE_TTL = 3600  # 1 hour
+
+
 def load_data():
     for cur, name in CURRENCIES.items():
         path = os.path.join(DATA_DIR, f'{cur}_tzs_clean.csv')
@@ -91,6 +100,34 @@ def load_models():
 def startup():
     load_data()
     load_models()
+
+
+def fetch_live_rate(cur_code):
+    """cur_code: 'USD', 'EUR', 'CNY'. Returns (rate_to_tzs, source_note) or None on failure."""
+    cached = _live_rate_cache.get(cur_code)
+    if cached and (time.time() - cached['ts']) < LIVE_RATE_TTL:
+        return cached['rate'], cached['note']
+    try:
+        resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8)
+        resp.raise_for_status()
+        payload = resp.json()
+        rates = payload.get('rates', {})
+        usd_to_tzs = rates.get('TZS')
+        if usd_to_tzs is None:
+            return None
+        if cur_code == 'USD':
+            rate = usd_to_tzs
+        else:
+            usd_to_cur = rates.get(cur_code)
+            if not usd_to_cur:
+                return None
+            rate = usd_to_tzs / usd_to_cur
+        note = payload.get('time_last_update_utc', 'live')
+        _live_rate_cache[cur_code] = {'rate': rate, 'note': note, 'ts': time.time()}
+        return rate, note
+    except Exception as e:
+        print(f"[LIVE RATE FETCH FAILED] {cur_code}: {e}")
+        return None
 
 
 def pred_arima(model, steps):
@@ -143,6 +180,10 @@ def pred_lstm(model, scaler, df, steps, seq=60):
         return None
 
 def get_ensemble(models_dict, df, cur_key, steps):
+    # NOTE: Prophet intentionally excluded here — backtesting showed it has
+    # the highest error of all 4 models across every currency (4-15% MAPE
+    # vs <3% for the others). Still loaded and shown in the debug panel for
+    # transparency, just not averaged into the live advice.
     forecasts = {}
     p = pred_xgboost(models_dict[cur_key]['xgboost'], df, steps)
     if p is not None: forecasts['XGBoost'] = p
@@ -151,8 +192,6 @@ def get_ensemble(models_dict, df, cur_key, steps):
         if p is not None: forecasts['LSTM'] = p
     p = pred_arima(models_dict[cur_key]['arima'], steps)
     if p is not None: forecasts['ARIMA'] = p
-    p = pred_prophet(models_dict[cur_key]['prophet'], steps)
-    if p is not None: forecasts['Prophet'] = p
     if not forecasts:
         return None, {}
     ensemble = np.mean(list(forecasts.values()), axis=0)
@@ -251,7 +290,28 @@ def forecast(
     if cur_display not in _data_cache:
         raise HTTPException(status_code=500, detail="Data not loaded")
 
-    df = _data_cache[cur_display]
+    cache_key = (cur_key, steps, purpose, amount)
+    cached = _forecast_cache.get(cache_key)
+    if cached and (time.time() - cached['ts']) < CACHE_TTL_SECONDS:
+        return cached['data']
+
+    df = _data_cache[cur_display].copy()
+    using_live_rate = False
+    live_note = None
+
+    live = fetch_live_rate(cur_display)
+    today_ts = pd.Timestamp(date_cls.today())
+    if live and df['date'].iloc[-1].date() < today_ts.date():
+        live_rate, live_note = live
+        recent_spread_pct = ((df['selling'] - df['buying']) / df['mean']).tail(30).mean()
+        est_buy = live_rate * (1 - recent_spread_pct / 2)
+        est_sell = live_rate * (1 + recent_spread_pct / 2)
+        new_row = pd.DataFrame([{
+            'date': today_ts, 'buying': est_buy, 'selling': est_sell, 'mean': live_rate
+        }])
+        df = pd.concat([df, new_row], ignore_index=True).sort_values('date').reset_index(drop=True)
+        using_live_rate = True
+
     current_rate = float(df['mean'].iloc[-1])
     prev_rate = float(df['mean'].iloc[-2])
     rate_delta = current_rate - prev_rate
@@ -271,9 +331,18 @@ def forecast(
     future_dates = [(df['date'].iloc[-1] + timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(steps)]
     hist = df.tail(120)
 
-    return {
+    # For debug transparency, also compute Prophet's prediction even though
+    # it's excluded from the live advice ensemble above.
+    debug_forecasts = dict(all_forecasts)
+    p_prophet = pred_prophet(_models_cache[cur_key]['prophet'], steps)
+    if p_prophet is not None:
+        debug_forecasts['Prophet'] = p_prophet
+
+    result = {
         "currency": cur_display,
         "current_rate": round(current_rate, 4),
+        "using_live_rate": using_live_rate,
+        "live_rate_source": live_note,
         "buying": round(float(df['buying'].iloc[-1]), 2),
         "selling": round(float(df['selling'].iloc[-1]), 2),
         "rate_delta": round(rate_delta, 4),
@@ -297,10 +366,13 @@ def forecast(
             "models_used": list(all_forecasts.keys()),
             "load_errors": _load_errors.get(cur_key, {}),
             "per_model_final_day": {
-                name: round(float(vals[-1]), 4) for name, vals in all_forecasts.items()
+                name: round(float(vals[-1]), 4) for name, vals in debug_forecasts.items()
             },
         },
     }
+
+    _forecast_cache[cache_key] = {'data': result, 'ts': time.time()}
+    return result
 
 @app.get("/api/compare")
 def compare():
