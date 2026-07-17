@@ -28,6 +28,11 @@ export default function App() {
   const currencyKey = CURRENCIES[currencyLabel]
   const steps = TIMEFRAMES[timeframeLabel]
 
+  // amount is intentionally NOT sent to the backend and NOT a dependency here.
+  // Rates/advice only depend on currency/steps/purpose. All amount x rate math
+  // (payment today, payment later, savings) is computed locally in the
+  // components below, so typing any amount -- including 0 -- updates instantly
+  // without a network round-trip and without ever hitting backend validation.
   const fetchData = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -36,7 +41,6 @@ export default function App() {
         currency: currencyKey,
         steps,
         purpose: purposeKey,
-        amount,
       })
       setData(result)
     } catch (err) {
@@ -44,7 +48,7 @@ export default function App() {
     } finally {
       setLoading(false)
     }
-  }, [currencyKey, steps, purposeKey, amount])
+  }, [currencyKey, steps, purposeKey])
 
   useEffect(() => {
     fetchData()
